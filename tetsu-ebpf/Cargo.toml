@@ -1,0 +1,17 @@
+[package]
+name = "tetsu-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+tetsu-common = { path = "../tetsu-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "tetsu"
+path = "src/main.rs"
