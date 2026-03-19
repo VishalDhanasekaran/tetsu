@@ -1,125 +1,66 @@
-use anyhow::{Context, Result};
-use aya::{
-    // Ebpf is the main struct for managing eBPF programs
-    Ebpf,
-    // Include the compiled eBPF bytecode at compile time
-    include_bytes_aligned,
-    // Map types for accessing eBPF data structures
-    maps::HashMap,
-    // Program types and traits
-    programs::{Xdp, XdpFlags},
-};
-use aya_log::EbpfLogger;
+use aya::{Bpf, programs::Xdp, maps::HashMap};
+use aya_log::BpfLogger;
 use clap::Parser;
 use log::{info, warn};
-use std::{
-    collections::BTreeMap,
-    time::Duration,
-};
-use tokio::{
-    signal,
-    time::interval,
-};
+use std::net::Ipv4Addr;
+use tetsu_common::Backend;
+use tokio::signal;
 
-// Command-line argument parsing using clap
-#[derive(Debug, Parser)]
-#[command(author, version, about, long_about = None)]
+#[derive(Parser, Debug)]
 struct Args {
-    /// Network interface to attach the XDP program to
-    #[arg(short, long, default_value = "eth0")]
-    interface: String,
+    #[clap(short, long, default_value = "eth0")]
+    iface: String,
+    
+    #[clap(long)]
+    vip: String, 
 
-    /// Polling interval in seconds for reading counters
-    #[arg(short, long, default_value = "1")]
-    poll_interval: u64,
+    #[clap(long)]
+    backend_mac: String, 
 }
 
-// Protocol number to name mapping for human-readable output
-fn protocol_name(proto: u8) -> &'static str {
-    match proto {
-        1 => "ICMP",
-        6 => "TCP",
-        17 => "UDP",
-        47 => "GRE",
-        50 => "ESP",
-        51 => "AH",
-        58 => "ICMPv6",
-        _ => "Other",
-    }
-}
-
-// Main async entry point using tokio runtime
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Parse command-line arguments
+async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
 
-   env_logger::init();
-
-    info!("Starting eBPF packet counter on interface {}", args.interface);
-
-   let mut ebpf = Ebpf::load(include_bytes_aligned!(
-        "../../target/bpfel-unknown-none/release/tetsu"
-    ))?;
-
-   if let Err(e) = EbpfLogger::init(&mut ebpf) {
-        warn!("Failed to initialize eBPF logger: {}", e);
+    // Load the eBPF program
+    let mut bpf = Bpf::load(include_bytes_aligned!("../../target/bpfel-unknown-none/release/tetsu-ebpf"))?;
+    
+    if let Err(e) = BpfLogger::init(&mut bpf) {
+        warn!("Failed to initialize logger: {}", e);
     }
 
-   let program: &mut Xdp = ebpf
-        .program_mut("packet_counter")
-        .context("Failed to find XDP program")?
-        .try_into()
-        .context("Program is not XDP type")?;
+    //Access the Map
+    let mut backends: HashMap<_, u32, Backend> = HashMap::try_from(bpf.map_mut("BACKENDS")?)?;
 
-   program.load().context("Failed to load XDP program")?;
+    // Parse Inputs
+    let vip: u32 = u32::from(Ipv4Addr::parse(args.vip.as_str())?); 
+    let vip_raw = u32::from_be(vip);
 
-   program
-        .attach(&args.interface, XdpFlags::default())
-        .context(format!("Failed to attach to interface {}", args.interface))?;
+    let mac_bytes: Vec<u8> = args.backend_mac
+        .split(':')
+        .map(|s| u8::from_str_radix(s, 16).unwrap())
+        .collect();
 
-    info!("XDP program attached successfully");
+    let mut mac_array = [0u8; 6];
+    mac_array.copy_from_slice(&mac_bytes);
 
-   let packet_count: HashMap<_, u8, u64> = HashMap::try_from(
-        ebpf.map("PACKET_COUNT")
-            .context("Failed to find PACKET_COUNT map")?,
-    )?;
+    let backend = Backend { mac: mac_array };
 
-    let mut poll_timer = interval(Duration::from_secs(args.poll_interval));
-
-    info!("Monitoring packets... Press Ctrl+C to stop");
-
-    loop {
-        tokio::select! {
-            _ = signal::ctrl_c() => {
-                info!("Received shutdown signal");
-                break;
-            }
-            _ = poll_timer.tick() => {
-                // Collect all counts into a sorted map for display
-                let mut stats: BTreeMap<u8, u64> = BTreeMap::new();
-
-                for result in packet_count.iter() {
-                    if let Ok((protocol, count)) = result {
-                        stats.insert(protocol, count);
-                    }
-                }
-
-                if !stats.is_empty() {
-                    println!("\n--- Packet Statistics ---");
-                    for (protocol, count) in &stats {
-                        println!(
-                            "Protocol {:3} ({:8}): {} packets",
-                            protocol,
-                            protocol_name(*protocol),
-                            count
-                        );
-                    }
-                }
-            }
-        }
+    unsafe {
+        backends.insert(&vip_raw, &backend, 0)?;
     }
+    info!("Inserted mapping: {} -> {:?}", args.vip, args.backend_mac);
 
-    info!("Shutting down...");
+    //Attach XDP Program
+    let program: &mut Xdp = bpf.program_mut("tetsu_lb").unwrap().try_into()?;
+    program.load()?;
+    program.attach(&args.iface, aya::programs::XdpFlags::default())?;
+
+    info!("Listening for packets on {}...", args.iface);
+    info!("Press Ctrl-C to exit...");
+
+    signal::ctrl_c().await?;
+    info!("Exiting...");
+
     Ok(())
 }
